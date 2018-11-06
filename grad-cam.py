@@ -1,3 +1,6 @@
+import json
+
+from keras import Model
 from keras.applications.vgg16 import (
     VGG16, preprocess_input, decode_predictions)
 from keras.preprocessing import image
@@ -10,6 +13,23 @@ import numpy as np
 import keras
 import sys
 import cv2
+from tensorflow.python.keras.utils import get_file
+import os
+import pandas as pd
+
+
+CLASS_INDEX_PATH = 'https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json'
+OUT_FOLDER = "./out"
+
+
+def get_image_base_name(image_url):
+    n = os.path.basename(image_url).split(".")[0]
+    return n.replace('_', '')
+
+
+
+
+
 
 def target_category_loss(x, category_index, nb_classes):
     return tf.multiply(x, K.one_hot([category_index], nb_classes))
@@ -60,6 +80,10 @@ def modify_backprop(model, name):
 
         # re-instanciate a new model
         new_model = VGG16(weights='imagenet')
+
+    #print("modify_backprop")
+    #print(model.summary())
+    #print(new_model.summary())
     return new_model
 
 def deprocess_image(x):
@@ -85,19 +109,26 @@ def deprocess_image(x):
     x = np.clip(x, 0, 255).astype('uint8')
     return x
 
+def _compute_gradients(tensor, var_list):
+  grads = tf.gradients(tensor, var_list)
+  return [grad if grad is not None else tf.zeros_like(var)
+          for var, grad in zip(var_list, grads)]
+
 def grad_cam(input_model, image, category_index, layer_name):
-    model = Sequential()
-    model.add(input_model)
 
     nb_classes = 1000
     target_layer = lambda x: target_category_loss(x, category_index, nb_classes)
-    model.add(Lambda(target_layer,
-                     output_shape = target_category_loss_output_shape))
+    #print(input_model.output)
+    x = Lambda(target_layer, output_shape=target_category_loss_output_shape)(input_model.output)
+    model = Model(inputs=input_model.input, outputs=x)
 
-    loss = K.sum(model.layers[-1].output)
-    conv_output =  [l for l in model.layers[0].layers if l.name is layer_name][0].output
-    grads = normalize(K.gradients(loss, conv_output)[0])
-    gradient_function = K.function([model.layers[0].input], [conv_output, grads])
+    #print(input_model.summary())
+    #print(model.summary())
+
+    loss = K.sum(model.output)
+    conv_output = [l for l in model.layers if l.name is layer_name][0].output
+    grads = normalize(_compute_gradients(loss, [conv_output])[0])
+    gradient_function = K.function([model.input], [conv_output, grads])
 
     output, grads_val = gradient_function([image])
     output, grads_val = output[0, :], grads_val[0, :, :, :]
@@ -122,22 +153,75 @@ def grad_cam(input_model, image, category_index, layer_name):
     cam = 255 * cam / np.max(cam)
     return np.uint8(cam), heatmap
 
-preprocessed_input = load_image(sys.argv[1])
 
-model = VGG16(weights='imagenet')
+def run_grad_cam(model, predicted_class, class_info, out_folder=OUT_FOLDER):
+    cam, heatmap = grad_cam(model, preprocessed_input, predicted_class, "block5_conv3")
+    cv2.imwrite(os.path.join(out_folder, "{}-{}-gradcam.jpg".format(image_id, class_info[1])), cam)
 
-predictions = model.predict(preprocessed_input)
-top_1 = decode_predictions(predictions)[0][0]
-print('Predicted class:')
-print('%s (%s) with probability %.2f' % (top_1[1], top_1[0], top_1[2]))
+    register_gradient()
+    guided_model = modify_backprop(model, 'GuidedBackProp')
+    saliency_fn = compile_saliency_function(guided_model)
+    saliency = saliency_fn([preprocessed_input, 0])
+    gradcam = saliency[0] * heatmap[..., np.newaxis]
+    cv2.imwrite(os.path.join(out_folder, "{}-{}-guided_gradcam.jpg".format(image_id, class_info[1])), deprocess_image(gradcam))
 
-predicted_class = np.argmax(predictions)
-cam, heatmap = grad_cam(model, preprocessed_input, predicted_class, "block5_conv3")
-cv2.imwrite("gradcam.jpg", cam)
 
-register_gradient()
-guided_model = modify_backprop(model, 'GuidedBackProp')
-saliency_fn = compile_saliency_function(guided_model)
-saliency = saliency_fn([preprocessed_input, 0])
-gradcam = saliency[0] * heatmap[..., np.newaxis]
-cv2.imwrite("guided_gradcam.jpg", deprocess_image(gradcam))
+
+def get_classes_path():
+    fpath = get_file(
+        'imagenet_class_index.json',
+        CLASS_INDEX_PATH,
+        cache_subdir='models',
+        file_hash='c2c37ea517e94d9795004a39431a14cb')
+
+    return fpath
+
+def get_classes():
+    fpath = get_classes_path()
+
+    with open(fpath) as f:
+        return json.load(f)
+
+def get_class_by_name(class_name):
+
+    CLASS_INDEX = get_classes()
+    for class_id, class_details in CLASS_INDEX.items():
+        # name = str.replace(class_name, "_", " ")
+        if class_name in class_details:
+            return int(class_id), class_details[1], class_details[0]
+
+    raise Exception("Impossible to find class {0} in Imagenet".format(class_name))
+
+
+def create_folder(folder):
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+image_id = ""
+
+if __name__ == '__main__':
+    image_id = get_image_base_name(sys.argv[1])
+
+    out_folder = os.path.join(OUT_FOLDER, image_id)
+    create_folder(out_folder)
+
+    preprocessed_input = load_image(sys.argv[1])
+
+    model = VGG16(weights='imagenet')
+
+    predictions = model.predict(preprocessed_input)
+    top_10 = decode_predictions(predictions, 10)[0]
+
+    top_10 = [(t[0], t[1], t[2], get_class_by_name(t[1])[0]) for t in top_10]
+
+    top_10_df = pd.DataFrame(top_10)
+    print(top_10_df)
+    top_10_df.to_csv(os.path.join(out_folder, "top_10.csv"))
+
+    for top_1 in top_10:
+        print('Predicted class:')
+        print('%s (%s) with probability %.2f' % (top_1[1], top_1[0], top_1[2]))
+        predicted_class = top_1[3]
+
+        run_grad_cam(model, predicted_class, top_1, out_folder)
+
